@@ -3,7 +3,7 @@ import torch, time, os
 
 from metrics import (compute_css, compute_mse_tgt, compute_mae_tgt,
                      compute_prs, compute_mse_nt, compute_mae_nt,
-                     compute_cga, compute_pe)#, compute_ncr)
+                     compute_cga, compute_pe)
 from utils import epoch_time
 
 def pgd_attack(model, X_left, X_right, target_dim, perturb_mask_t, epsilon, alpha, pgd_steps, lam_ntgt, lam_smooth):
@@ -127,8 +127,8 @@ def run_condition(model, val_dl, X_val_right, target_dim, perturb_mask, conditio
     agg_pred_clean = torch.cat(agg_pred_clean, dim=0)
     agg_pred_adv = torch.cat(agg_pred_adv, dim=0)
     agg_deltas = torch.cat(agg_deltas, dim=0)
-    agg_inputs = torch.cat(agg_inputs, dim=0)    # NEW: (N, T, M)
-    agg_gt = torch.cat(agg_gt, dim=0)            # NEW: (N, H, M)
+    agg_inputs = torch.cat(agg_inputs, dim=0)
+    agg_gt = torch.cat(agg_gt, dim=0)
     X_right_t = torch.FloatTensor(np.array(X_val_right))
 
     # --- Existing metrics (5) ---
@@ -258,7 +258,7 @@ def save_attack_artifacts(results, metadata_dir, prefix):
     Args:
         results   : dict returned by run_condition() — modified in place
         save_dir  : directory to save the .npz file
-        prefix    : filename prefix, e.g. 'parent_only_train'
+        prefix    : filename prefix
 
     Returns:
         path to the saved .npz file

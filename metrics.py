@@ -16,10 +16,6 @@ def compute_css(pred_clean, pred_adv, target_dim, gamma=1e-8):
     css = tgt_shift / (nt_shift + gamma)
     return css
 
-# ======================================================================
-# NEW: All remaining metrics (7 functions below)
-# ======================================================================
-
 def compute_mse_tgt(pred_adv, ground_truth, target_dim):
     """
     MSEtgt = (1/H) \SUM (f(X_hat)^(j)_h - Y^(j)_h)^2
