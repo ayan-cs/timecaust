@@ -42,7 +42,7 @@ A three-condition intervention experiment — parent-only, non-parent-only, and 
 
 These are introduced to quantify, respectively, the selectivity of the attack toward the target channel, structural alignment of the perturbation with the causal graph, and target disruption delivered per unit perturbation budget.
 
-- **Causal Selectivity Score** $\; \mathrm{CSS} = \frac{\big\| \tilde{y}^{(i)} - \hat{y}^{(i)} \big\|_{F}}{\big\| \tilde{y}^{(-i)} - \hat{y}^{(-i)} \big\|_{F} + \gamma}$
+- **Causal Selectivity Score** $$\; \mathrm{CSS} = \frac{\big\| \tilde{y}^{(i)} - \hat{y}^{(i)} \big\|_{F}}{\big\| \tilde{y}^{(-i)} - \hat{y}^{(-i)} \big\|_{F} + \gamma}$$
 - **Causal Graph Alignment** $\; \mathrm{CGA} = \frac{\big\| \delta^{(\mathcal{P}_i)} \big\|_{F}}{\big\| \delta \big\|_{F} + \gamma}$
 - **Perturbation Efficiency** $\; \mathrm{PE} = \frac{\big\| \tilde{y}^{(i)} - \hat{y}^{(i)} \big\|_{F}}{\big\| \delta \big\|_{F} + \gamma}$
 
