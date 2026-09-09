@@ -7,18 +7,20 @@
 <p align="center">
   <!-- <a> href="https://openreview.net/forum?id=Al4OnLoQsp"> -->
   <a>
-    <img src="https://img.shields.io/badge/IEEEXplore-Coming Soon-174359">
-  </a>
-  <a href="https://github.com/ayan-cs/timecaust">
-    <img src="https://visitor-badge.laobi.icu/badge?page_id=ayan-cs.TimeCauST">
+    <img src="https://img.shields.io/badge/XPLORE-Coming Soon-005995?style=for-the-badge&logo=ieee">
   </a>
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/PyTorch-2.13.0-red">
-  <img src="https://img.shields.io/badge/CUDA-13.2-green">
-  <img src="https://img.shields.io/badge/scikit--learn-1.8.0-F7931E">
-  <img src="https://img.shields.io/badge/License-MIT-blue">
-  <img src="https://img.shields.io/badge/Reproducibility-Verified-success">
+  <img src="https://img.shields.io/badge/PyTorch-2.13.0-EE4C2C?style=for-the-badge&logo=pytorch&labelColor=dddddd">
+  <img src="https://img.shields.io/badge/CUDA-13.2-green?style=for-the-badge&logo=nvidia&labelColor=dddddd">
+  <img src="https://img.shields.io/badge/scikit--learn-1.8.0-F7931E?style=for-the-badge&logo=scikit-learn&labelColor=dddddd">
+  <img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge&labelColor=dddddd">
+  <img src="https://img.shields.io/badge/Reproducibility-Verified-success?style=for-the-badge&labelColor=dddddd">
+</p>
+<p align="center">
+<a href="https://github.com/ayan-cs/timecaust">
+    <img src="https://visitor-badge.laobi.icu/badge?page_id=ayan-cs.TimeCauST?style=for-the-badge">
+  </a>
 </p>
 
 ## 🔭 Overview
@@ -42,16 +44,24 @@ A three-condition intervention experiment — parent-only, non-parent-only, and 
 
 These are introduced to quantify, respectively, the selectivity of the attack toward the target channel, structural alignment of the perturbation with the causal graph, and target disruption delivered per unit perturbation budget.
 
-- **Causal Selectivity Score** $$\; \mathrm{CSS} = \frac{\big\| \tilde{y}^{(i)} - \hat{y}^{(i)} \big\|_{F}}{\big\| \tilde{y}^{(-i)} - \hat{y}^{(-i)} \big\|_{F} + \gamma}$$
-- **Causal Graph Alignment** $\; \mathrm{CGA} = \frac{\big\| \delta^{(\mathcal{P}_i)} \big\|_{F}}{\big\| \delta \big\|_{F} + \gamma}$
-- **Perturbation Efficiency** $\; \mathrm{PE} = \frac{\big\| \tilde{y}^{(i)} - \hat{y}^{(i)} \big\|_{F}}{\big\| \delta \big\|_{F} + \gamma}$
+- **Causal Selectivity Score**
+
+  $$\mathrm{CSS} = \frac{\big\| \tilde{y}^{(i)} - \hat{y}^{(i)} \big\|\_{F}}{\big\| \tilde{y}^{(-i)} - \hat{y}^{(-i)} \big\|_{F} + \gamma}$$
+
+- **Causal Graph Alignment**
+
+  $\mathrm{CGA} = \frac{\big\| \delta^{(\mathcal{P}\_i)} \big\|_{F}}{\big\| \delta \big\|\_{F} + \gamma}$
+
+- **Perturbation Efficiency**
+
+  $\mathrm{PE} = \frac{\big\| \tilde{y}^{(i)} - \hat{y}^{(i)} \big\|\_{F}}{\big\| \delta \big\|\_{F} + \gamma}$
 
 ---
 ## 🔬 Methodology
 
 ### 1. Causal parent set extraction
 
-Given white-box access to the victim model's learned Granger-causal adjacency matrix $A$, TimeCauST computes the parent set $P_i = \{j : A_{ij} = 1\}$ for the designated target channel $i$. No separate causal discovery is performed; the victim's own graph is consumed directly.
+Given white-box access to the victim model's learned Granger-causal adjacency matrix $A$, TimeCauST computes the parent set $P_i = \\{j : A_{ij} = 1\\}$ for the designated target channel $i$. No separate causal discovery is performed; the victim's own graph is consumed directly.
 
 ### 2. Structural feasibility set and projection
 
@@ -68,6 +78,47 @@ The structural constraint is not a soft penalty in the objective — it is enfor
 
 ---
 ## 🛠️ Execution
+
+### Setup
+
+```bash
+git clone git@github.com:ayan-cs/timecaust.git
+cd timecaust
+```
+
+### Environment I used
+```
+python==3.14.5
+pytorch==2.13.0+cu132
+scikit-learn==1.8.0
+numpy==2.3.5
+```
+
+Everything is configured in `config.py` — there is no command-line interface.
+
+### 1. Generate the dataset
+
+Each dynamical system has its own generator under `data/.` This release ships the Hénon system used in the paper's experiments:
+```
+python -m data.henon_gen
+```
+This writes `data/henon/henon_<timesteps>_<dims>.npz` — the raw trajectory, its z-score-standardized copy, and the ground-truth Granger-causal adjacency matrix the CR-VAE surrogate and the attack both consume.
+
+### 2. Train the CR-VAE surrogate (victim model)
+
+```
+python run_model.py
+```
+
+Reads `config.RUN_DATASETS / config.RUN_SEEDS` (defaults to Hénon, seed 42) and grid-searches `config.CRVAE_PARAM_GRID`. Every combination is trained to early stopping; the one with the lowest validation loss is written to: `artifacts/seed<S>/artifacts_henon/crvae__grid__seed<S>__<timestamp>/best/checkpoint.pt` and promoted as the dataset's selected checkpoint in `artifacts/seed<S>/artifacts_henon/registry.json`.
+
+### 3. Run the TimeCauST attack
+
+```
+python run_attack.py
+```
+
+Automatically finds the checkpoint trained in Step 2 via `registry.json` — no path to type in by hand. It then runs the causally-constrained PGD attack from `config.ATTACK_PARAM_GRID` against every target channel, under three conditions (parent-only / non-parent-only / random-mask control), and writes per-combination results to: `artifacts/seed<S>/artifacts_henon/attacks/timecaust__grid__seed<S>__<timestamp>/` including the CSS / CGA / PE metrics.
 
 ---
 ## 📭 Contact
