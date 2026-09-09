@@ -1,19 +1,3 @@
-"""
-utils/attack_utils.py
-The TimeCAT attack itself: a per-batch PGD attack with a two-stage causal
-projection (clip the allowed channels, zero every disallowed one), plus the
-machinery to run it under one channel-selection condition (parent-only /
-non-parent-only / random) and save its per-instance results.
-
-Ported from TimeCAT_new's helpers.py unchanged in math. What changed is
-engineering only: `run_condition` took an implicit 'cuda' device (a bare
-`.cuda()` on every batch, and a hardcoded `device='cuda'` when building the
-perturbation mask), so -- like crvae_model.model.LSTMEncoder before its own
-device fix -- it could only ever run on a GPU machine. It now takes `device`
-explicitly, resolved once by the caller via utils.common.resolve_device; on
-a CUDA machine this resolves to exactly the same device as before.
-"""
-
 from __future__ import annotations
 
 import os
@@ -30,22 +14,6 @@ from metrics import (
 
 
 def pgd_attack(model, X_left, X_right, target_dim, perturb_mask_t, epsilon, alpha, pgd_steps, lam_ntgt, lam_smooth):
-    """
-    Per-batch PGD attack with two-stage causal projection.
-    Args:
-        model       : frozen forecasting model
-        X_left      : (B, T, M) input context window
-        X_right     : (B, H, M) ground truth future
-        target_dim  : int, target channel j
-        perturb_mask_t : (M,) bool tensor on device, channels allowed to perturb
-        epsilon     : perturbation budget (L-inf)
-        alpha       : PGD step size
-        pgd_steps   : number of PGD iterations
-        lam_ntgt    : weight for non-target penalty
-        lam_smooth  : weight for temporal smoothness
-    Returns:
-        delta, pred_clean, pred_adv_final, loss_history
-    """
     model.eval()
     B, T, M = X_left.shape
     H = X_right.shape[1]
@@ -115,12 +83,7 @@ def pgd_attack(model, X_left, X_right, target_dim, perturb_mask_t, epsilon, alph
     return delta.detach(), pred_clean, pred_adv_final, loss_history
 
 
-def run_condition(model, val_dl, X_val_right, target_dim, perturb_mask, condition_name, device,
-                   epsilon, alpha, pgd_steps, lam_ntgt, lam_smooth):
-    """
-    Run PGD attack under a specific perturbation condition across all
-    batches of `val_dl`. Returns an aggregated results dict.
-    """
+def run_condition(model, val_dl, X_val_right, target_dim, perturb_mask, condition_name, device, epsilon, alpha, pgd_steps, lam_ntgt, lam_smooth):
     perturb_mask_t = torch.tensor(perturb_mask, dtype=torch.bool, device=device)
 
     agg_pred_clean = []
@@ -199,14 +162,6 @@ def run_condition(model, val_dl, X_val_right, target_dim, perturb_mask, conditio
         'delta_l2_avg': delta_l2_avg, 'delta_fro': delta_fro, 'delta_linf': delta_linf,
         'perturbed_channels': np.where(perturb_mask)[0].tolist(),
         'num_perturbed_channels': int(perturb_mask.sum()),
-        # These are numpy arrays (not JSON-serializable) -- attack.py saves
-        # them via save_attack_artifacts below and replaces these entries
-        # with the saved file's path before JSON-serializing the rest.
-        #   inputs[i]          = X_left for sample i    -- shape (T, M)
-        #   attack_vectors[i]  = delta  for sample i    -- shape (T, M)
-        #   ground_truths[i]   = X_right for sample i   -- shape (H, M)
-        #   pred_clean[i]      = clean forecast for i   -- shape (H, M)
-        #   pred_adv[i]        = adversarial forecast   -- shape (H, M)
         'inputs': agg_inputs.numpy(),
         'attack_vectors': agg_deltas.numpy(),
         'ground_truths': agg_gt.numpy(),
@@ -232,19 +187,6 @@ def _hms(elapsed_seconds):
 
 
 def save_attack_artifacts(results, metadata_dir, prefix):
-    """
-    Extract numpy arrays from a results dict, save them as a single .npz,
-    and replace the dict entries with the file path so the dict stays
-    JSON-serializable.
-
-    Args:
-        results   : dict returned by run_condition() -- modified in place
-        metadata_dir : directory to save the .npz file in
-        prefix    : filename prefix, e.g. 'comb1_train_parent'
-
-    Returns:
-        path to the saved .npz file
-    """
     _ARRAY_KEYS = ['inputs', 'attack_vectors', 'ground_truths', 'pred_clean', 'pred_adv']
     arrays = {k: results[k] for k in _ARRAY_KEYS if k in results}
     if not arrays:
@@ -255,6 +197,6 @@ def save_attack_artifacts(results, metadata_dir, prefix):
 
     for k in _ARRAY_KEYS:
         if k in results:
-            results[k] = npz_path  # all keys point to the same file
+            results[k] = npz_path
 
     return npz_path

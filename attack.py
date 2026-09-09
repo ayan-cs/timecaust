@@ -1,49 +1,3 @@
-"""
-attack.py
-TimeCAT attack driver, consolidated from TimeCAT_new's seven near-identical
-timecat_<dataset>.py scripts (same duplication pattern as
-crvae_model/train.py's seven train_<dataset>.py: only the dataset/model-
-artifact strings and the combination index to load differed). For a trained
-surrogate checkpoint (found automatically by reading the dataset's
-registry.json -- written by crvae_model.train, but read here with nothing
-but a plain json.load -- instead of a hand-typed model_artifact string +
-checkpoint_comb<i>.pt path), this runs the PGD attack from
-utils.attack_utils under three channel-selection conditions -- parent-only
-(TimeCAT itself), non-parent-only, and several random-mask control trials --
-for every (target channel, hyperparameter combination) in
-config.ATTACK_PARAM_GRID, on both the train and val splits.
-
-This file, and everything it imports from utils/, is the attack stage. It
-never imports crvae_model.train or crvae_model.utils -- the only things it
-takes from the surrogate-training side are crvae_model.model (the cLSTM
-class itself, needed to instantiate the architecture a checkpoint's weights
-get loaded into; see utils.data_utils.load_model) and the checkpoint.pt
-file on disk. See utils/common.py's module docstring for the full
-training/attack split.
-
-One call to `run_attack_grid` (via `run_dataset_seed`) produces:
-
-artifacts/seed<S>/artifacts_<dataset>/attacks/timecat__grid__seed<S>__<timestamp>/
-    global_logs.log            every combination's log lines, in one file (the
-                                original timecat_<dataset>.py scripts redirected
-                                sys.stdout to a fresh dim_<j>/logs/attack_comb<k>.log
-                                per combination instead; this project uses one
-                                combined log per grid everywhere, same as
-                                crvae_model/train.py's run.log)
-    experiment_summary.json    which surrogate run was attacked, grid size, total runtime
-    dim_<j>/
-        metadata/
-            comb<k>_metadata.json      full per-combination results (both splits,
-                                        all three conditions, ordering checks)
-            all_metadata.jsonl         same, one JSON line per combination
-            *_vectors.npz              per-instance inputs/attack_vectors/
-                                        ground_truths/pred_clean/pred_adv for
-                                        each (combination, split, condition)
-
-Run `python analyze_results.py --exp_dir <that folder>` afterwards to rank
-combinations and get results_*.csv / best_combinations_*.json.
-"""
-
 from __future__ import annotations
 
 import traceback
@@ -168,10 +122,8 @@ def run_attack_grid(dataset: str, seed: int, artifacts_root: str | Path) -> dict
                         "combination": i, "dataset": dataset, "target_dim": j,
                         "parent_channels": np.where(parent_mask)[0].tolist(), "n_dim": n_dim,
                         "hyperparameters": {**hp, "n_random_trials": n_random_trials},
-                        "results_train_set": {"parent_only": parent_tr, "nonparent_only": nonparent_tr,
-                                               "random_trials": rand_tr_list, "random_aggregated": rand_agg_tr},
-                        "results_val_set": {"parent_only": parent_val, "nonparent_only": nonparent_val,
-                                             "random_trials": rand_val_list, "random_aggregated": rand_agg_val},
+                        "results_train_set": {"parent_only": parent_tr, "nonparent_only": nonparent_tr, "random_trials": rand_tr_list, "random_aggregated": rand_agg_tr},
+                        "results_val_set": {"parent_only": parent_val, "nonparent_only": nonparent_val, "random_trials": rand_val_list, "random_aggregated": rand_agg_val},
                         "ordering_train_set": {m: _ordering(m, parent_tr, nonparent_tr, rand_agg_tr) for m in ["css", "pe"]},
                         "ordering_val_set": {m: _ordering(m, parent_val, nonparent_val, rand_agg_val) for m in ["css", "pe"]},
                     }

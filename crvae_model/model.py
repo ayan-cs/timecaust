@@ -1,36 +1,3 @@
-"""
-crvae_model/model.py
-The surrogate forecaster attacked by TimeCAT: a causally-masked VAE-LSTM
-(cLSTM). One shared LSTMEncoder turns the input window into a Gaussian
-latent (z_h, z_c) for the whole system; one LSTMDecoder per target channel
-then forecasts that channel from the latent plus only its *parents'* values
-(per the dataset's ground-truth causal graph), so an attacker who wants to
-move channel j's forecast is, by the model's own construction, forced to
-perturb j's causal parents to have any legitimate structural effect.
-
-Ported from crvae_model/model.py (TimeCAT_new) unchanged in math -- same
-forward pass, same losses, same architecture -- with one real bug fixed:
-
-- LSTMEncoder.forward hardcoded `device='cuda'` when building its initial
-  hidden/cell state, so the model could only ever run on a GPU machine (a
-  CPU forward pass would immediately fail on a device mismatch). It now uses
-  the input tensor's own device, matching utils.common.resolve_device's
-  design (see that module's docstring on the same class of bug in the
-  sibling codebase_caufrts project). On a CUDA machine this resolves to
-  exactly the same device as before, so it changes nothing there.
-
-One thing this file does *not* fix, on purpose: cLSTM's constructor only
-ever took `n_dim`, `hidden_size`, and `causal_graph` -- `num_layers` and
-`dropout` were accepted by the old train_<dataset>.py scripts' hyperparameter
-grids and written into metadata.json, but LSTMEncoder/LSTMDecoder never
-actually received them (both hardcode a single-layer nn.LSTM with no dropout
-argument). Sweeping those two keys in the original grids was therefore a
-no-op -- every "different num_layers/dropout" combination trained the exact
-same architecture. Left as-is here to keep this port bit-identical to the
-original model; config.py's CRVAE_PARAM_GRID keeps both as fixed singletons
-([1] and [0]) rather than pretending they are still swept.
-"""
-
 import torch, torch.nn as nn
 import numpy as np
 
@@ -49,8 +16,6 @@ class LSTMEncoder(nn.Module):
         self.fc_logvar_c = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, X_left):
-        # Initial hidden/cell state, both zero, on the same device as the
-        # input (was hardcoded 'cuda' -- see this file's module docstring).
         h_0 = torch.zeros(1, X_left.shape[0], self.hidden_size, device=X_left.device)
         _, (hidden_out, cell_out) = self.lstm(X_left, (h_0, h_0))
         hidden_out = hidden_out[-1].unsqueeze(0)
@@ -88,14 +53,6 @@ class LSTMDecoder(nn.Module):
 
 
 class cLSTM(nn.Module):
-    """One shared LSTMEncoder over the full (isolated-channel-free) input
-    window, one LSTMDecoder per target channel reading off the shared latent
-    plus only that channel's parents (causal_graph[d]). A decoder's input
-    width is therefore int(causal_graph[d].sum()) -- the architecture itself
-    is shaped by the causal graph, which is why `causal_graph` is part of the
-    model's own hyperparameters (see utils.data_utils.load_model) rather
-    than something a caller supplies separately at inference time."""
-
     def __init__(self, n_dim, hidden_size, causal_graph):
         super(cLSTM, self).__init__()
         self.n_dim = n_dim

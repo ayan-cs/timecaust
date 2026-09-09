@@ -1,24 +1,3 @@
-"""
-run_attack.py
-Single entry point for the TimeCAT attack. Reads RUN_DATASETS and RUN_SEEDS
-from config.py -- nothing is passed on the command line. Each dataset must
-already have a trained surrogate (python run_model.py) before it can be
-attacked; attack.py reads that dataset's registry.json to find which
-checkpoint to use.
-
-    python run_attack.py
-
-Same in-process-if-one-job / subprocess-per-job dispatch as run_model.py;
-see that file's docstring for the reasoning, including why subprocess runs
-just inherit this process's own stdout/stderr instead of being captured to
-a logs_all/seed<S>/ file -- attack.py's own run_attack_grid already writes
-every line to that run's own artifacts/.../global_logs.log via
-utils.common.get_logger (which dual-writes to both stdout and that file),
-so a second copy here was pure duplication, and was silently never created
-at all whenever RUN_DATASETS/RUN_SEEDS was trimmed to a single job (the
-in-process branch below never touched it either).
-"""
-
 from __future__ import annotations
 
 import os
@@ -54,10 +33,6 @@ def _run_inprocess(dataset: str, seed: int) -> int:
 def _run_subprocess(dataset: str, seed: int, env: dict) -> int:
     job_env = {**env, "TCAT_DATASET": dataset, "TCAT_SEED": str(seed)}
     print(f"\nAttacking: {dataset} | seed {seed} | started {timestamp()}", flush=True)
-    # No stdout/stderr redirection: the subprocess inherits this process's
-    # own streams, so its output (and that run's own global_logs.log,
-    # written by attack.py itself) is the only place it's recorded -- see
-    # the module docstring above.
     proc = subprocess.Popen([sys.executable, "-m", "attack"], env=job_env)
     return proc.wait()
 

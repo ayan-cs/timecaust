@@ -1,28 +1,10 @@
-"""
-data/henon_gen.py
-Coupled-Henon-map dataset: node i's next value depends on its own lag-1/lag-2
-history and (for i > 0) its left neighbor's lag-1 value -- see
-data.graphs.henon_graph for the resulting ground-truth adjacency.
-
-Ported from data_prep.ipynb's "Henon" section. One indexing bug fixed: the
-notebook seeded its whole (T+1, D) array with np.random.rand up front, then
-ran the recurrence starting at i=0, whose `X[i-1][j]` term is `X[-1][j]` for
-i=0 -- i.e. it read the *last* (still-uninitialized, not-yet-simulated) row
-of the array as if it were the previous step, purely because of Python/NumPy
-negative-index wraparound. burn_in discards the first 100 steps regardless,
-so this never reached the retained data, but it is not something to
-reproduce on purpose: this version seeds two proper initial rows and starts
-the recurrence at i=1, so every step reads a real, already-simulated
-predecessor. Run directly (`python -m data.henon_gen`) to (re)write the .npz.
-"""
-
 from __future__ import annotations
 
 import os
 
 import numpy as np
 
-from timecaust.data.gen_utils import save_dataset
+from data.gen_utils import save_dataset
 from data.graphs import henon_graph
 
 D = 10
@@ -48,7 +30,7 @@ def generate_henon(D=10, T=10000, burn_in=100, a=1.4, b=0.3, seed=42):
                 x_next[j] = a - X[i][j] ** 2 + b * X[i - 1][j]
         X[i + 1] = x_next
 
-    X_raw = X[-T:]  # drop the invented row + burn-in; keep exactly T rows
+    X_raw = X[-T:]
     meta = {"system": "henon", "D": D, "T": T, "burn_in": burn_in, "a": a, "b": b, "seed": seed}
     return X_raw, A, meta
 

@@ -1,67 +1,3 @@
-"""
-crvae_model/train.py
-Grid-search trainer for the cLSTM surrogate forecaster, consolidated from
-TimeCAT_new's seven near-identical train_<dataset>.py scripts (henon,
-lorenz, ecoli, yeast, ecoliM, yeastM, synhill differed only in which
-dataset/artifact string and hyperparameter grid were hardcoded at the
-bottom of the file; the training loop itself was byte-for-byte the same
-seven times over). Lives inside crvae_model/, next to the model it trains,
-and imports only from crvae_model itself (crvae_model.model,
-crvae_model.utils.*) plus config.py and a dataset's .npz -- never from the
-project root's utils/ package, which is the attack stage's own, separate
-copy (see crvae_model/utils/common.py's module docstring). The root is for
-the pipeline's entry points (run_model.py, run_attack.py) and the attack
-itself (attack.py), not for this stage's implementation. One call to `run_grid`
-(via `run_dataset_seed`) produces one run directory, stored directly under
-the dataset's own artifacts folder:
-
-artifacts/seed<S>/artifacts_<dataset>/crvae__grid__seed<S>__<timestamp>/
-    run.log             every combination's log lines, in one file (the
-                         original scripts redirected sys.stdout to a fresh
-                         file per combination)
-    meta.json           grid + data + env summary, best trial pointer, total runtime
-    grid_results.csv    one row per combination: hyperparameters, best_val_loss, status
-    test_windows.npz    held-out test split, same for every trial in this grid
-    trials/comb_XXXX/
-        checkpoint.pt   this combination's own best (early-stopped) weights,
-                         self-contained: n_dim, hidden_size and the causal
-                         graph itself travel with it (see the attack-side
-                         utils.data_utils.load_model, which reads this file
-                         back without needing any code from this package)
-        metadata.json   this combination's config + best-epoch summary + held-out test eval
-        history.npz     that trial's full per-epoch loss curves
-    best/
-        checkpoint.pt   the combination with the lowest best_val_loss
-        metadata.json
-        history.npz
-
-and updates artifacts/seed<S>/artifacts_<dataset>/registry.json. The attack
-stage (attack.py, at the project root) reads that registry to find which
-experiment directory -- and, inside it, which checkpoint.pt -- to load; the
-checkpoint file is the only handoff between the two stages, not a shared
-import.
-
-What changed vs. the original train_<dataset>.py, besides the de-duplication:
-  - hyperparameter combinations come from config.CRVAE_PARAM_GRID instead of
-    being hardcoded per dataset at the bottom of each file;
-  - device placement goes through crvae_model.utils.common.resolve_device
-    instead of a bare `.cuda()` (see crvae_model.model's docstring on the
-    same class of portability bug);
-  - a failing combination logs its full traceback and the grid moves on to
-    the next one, instead of the whole run dying;
-  - train/val split is now chronological, with a third held-out test split
-    evaluated once per trial on the reloaded best weights (see
-    crvae_model.utils.data_utils.create_split_windows's docstring) -- the
-    original scripts only ever produced a random 80/20 train/val split;
-  - every epoch's loss components (mse/kl), not just the combined loss, are
-    genuine epoch-wide sample-weighted averages -- the original code
-    computed `train_mse` from `total_train_loss` (a copy-paste bug: line
-    `train_mse = total_train_loss / len(train_dl.dataset)` used the wrong
-    accumulator), so the "MSE" curve it logged was actually a second copy of
-    the combined loss curve, not the MSE term alone. Fixed here by dividing
-    each accumulator by its own name.
-"""
-
 from __future__ import annotations
 
 import traceback
@@ -78,10 +14,6 @@ import config
 from crvae_model.model import cLSTM
 from crvae_model.utils import common, data_utils
 
-
-# --------------------------------------------------------------------------- #
-# One epoch (train + val)
-# --------------------------------------------------------------------------- #
 def train_epoch(model, train_dl, val_dl, optimizer, beta_kl, device):
     model.train()
     agg = {"loss": 0.0, "mse": 0.0, "kl": 0.0}
@@ -122,7 +54,6 @@ def train_epoch(model, train_dl, val_dl, optimizer, beta_kl, device):
 
 @torch.no_grad()
 def eval_epoch(model, loader, beta_kl, device):
-    """One no-grad pass, used for the held-out test split once, after training."""
     model.eval()
     agg = {"loss": 0.0, "mse": 0.0, "kl": 0.0}
     n = 0
@@ -138,18 +69,13 @@ def eval_epoch(model, loader, beta_kl, device):
         n += bs
     return {k: v / n for k, v in agg.items()}
 
-
-# --------------------------------------------------------------------------- #
-# One trial (one hyperparameter combination, trained to early stopping)
-# --------------------------------------------------------------------------- #
 def _make_loader(windows, batch_size, shuffle):
     lefts, rights = zip(*(data_utils.split_window(np.array(w)) for w in windows))
     ds = TensorDataset(torch.FloatTensor(np.array(lefts)), torch.FloatTensor(np.array(rights)))
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 
 
-def run_trial(hp: dict, dataset: str, seed: int, n_dim: int, causal_graph,
-              X_train, X_val, X_test, device, logger) -> dict:
+def run_trial(hp: dict, dataset: str, seed: int, n_dim: int, causal_graph, X_train, X_val, X_test, device, logger) -> dict:
     lr, batch_size, hidden_size, num_layers, dropout, beta_kl = (
         hp["lr"], hp["batch_size"], hp["hidden_size"], hp["num_layers"], hp["dropout"], hp["beta_kl"]
     )
@@ -161,8 +87,7 @@ def run_trial(hp: dict, dataset: str, seed: int, n_dim: int, causal_graph,
 
     model = cLSTM(n_dim=n_dim, hidden_size=hidden_size, causal_graph=causal_graph).to(device)
     optimizer = AdamW(model.parameters(), lr=lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=config.CRVAE_TRAIN["lr_factor"],
-                                   patience=config.CRVAE_TRAIN["lr_patience"])
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=config.CRVAE_TRAIN["lr_factor"], patience=config.CRVAE_TRAIN["lr_patience"])
 
     history: list[dict] = []
     best_epoch, best_val_loss, best_state = 0, float("inf"), None
@@ -208,8 +133,6 @@ def run_trial(hp: dict, dataset: str, seed: int, n_dim: int, causal_graph,
     model.load_state_dict(best_state)
     best_record = history[best_epoch - 1]
 
-    # Held-out test evaluation: one pass, on the reloaded best weights.
-    # Never used for model selection -- purely recorded for later inspection.
     test_dl = _make_loader(X_test, batch_size, shuffle=False)
     with common.Timer() as test_timer:
         test_agg = eval_epoch(model, test_dl, beta_kl, device)
@@ -230,9 +153,6 @@ def run_trial(hp: dict, dataset: str, seed: int, n_dim: int, causal_graph,
     return {"model": model, "model_hp": model_hp, "metadata": metadata, "history": history, "train_time_s": train_time}
 
 
-# --------------------------------------------------------------------------- #
-# Grid search over one (dataset, seed)
-# --------------------------------------------------------------------------- #
 def run_grid(dataset: str, seed: int, artifacts_root: str | Path) -> dict:
     trials = config.expand_crvae_grid()
     ds_cfg = config.DATASETS[dataset]
@@ -280,8 +200,7 @@ def run_grid(dataset: str, seed: int, artifacts_root: str | Path) -> dict:
             trial_dir.mkdir(parents=True, exist_ok=True)
 
             try:
-                out = run_trial(hp=hp, dataset=dataset, seed=seed, n_dim=n_dim, causal_graph=causal_graph,
-                                 X_train=X_train, X_val=X_val, X_test=X_test, device=device, logger=logger)
+                out = run_trial(hp=hp, dataset=dataset, seed=seed, n_dim=n_dim, causal_graph=causal_graph, X_train=X_train, X_val=X_val, X_test=X_test, device=device, logger=logger)
             except Exception as e:
                 logger.error(f"[FAILED] combination {i:04d} | hp={hp}\n{traceback.format_exc()}")
                 row = {k: None for k in row_keys}
@@ -369,10 +288,6 @@ def run_dataset_seed(dataset: str, seed: int, artifacts_root: str | Path | None 
 
 if __name__ == "__main__":
     import os
-    # Used when run_model.py dispatches this as a subprocess: it sets TCAT_DATASET /
-    # TCAT_SEED for exactly one job. Running `python -m crvae_model.train`
-    # directly (no env vars set) falls back to the first entry of
-    # config.RUN_DATASETS / config.RUN_SEEDS.
     _dataset = os.environ.get("TCAT_DATASET", config.RUN_DATASETS[0])
     _seed = int(os.environ.get("TCAT_SEED", config.RUN_SEEDS[0]))
     run_dataset_seed(_dataset, _seed)
