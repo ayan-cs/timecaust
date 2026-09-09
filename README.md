@@ -72,14 +72,11 @@ The structural constraint is not a soft penalty in the objective — it is enfor
 ---
 ## 📭 Contact
 
-<p align='left'>
+<p align="left">
     <a href="https://www.linkedin.com/in/ayanabha-ghosh-cs">
         <img src="https://img.shields.io/badge/Linkedin-Connect-0a66c2?style=for-the-badge">
     </a>
-    <a>
-        <img src="https://img.shields.io/badge/Official-p23iot002%40iitj.ac.in-%23fcebca?style=for-the-badge&logo=gmail&labelColor=white
-        ">
-    </a>
+    <img src="https://img.shields.io/badge/Official-p23iot002%40iitj.ac.in-%23fcebca?style=for-the-badge&logo=gmail&labelColor=white">
     <a href="https://sites.google.com/view/ayanabha">
         <img src="https://img.shields.io/badge/Portfolio-Visit-%2326c7c2?style=for-the-badge&logo=googlechrome&logoColor=%23ffffff
         ">
