@@ -1,253 +1,378 @@
-import torch, os, json, sys, time, gc
-import torch.nn.functional as f
-from torch.utils.data import DataLoader, TensorDataset
+"""
+crvae_model/train.py
+Grid-search trainer for the cLSTM surrogate forecaster, consolidated from
+TimeCAT_new's seven near-identical train_<dataset>.py scripts (henon,
+lorenz, ecoli, yeast, ecoliM, yeastM, synhill differed only in which
+dataset/artifact string and hyperparameter grid were hardcoded at the
+bottom of the file; the training loop itself was byte-for-byte the same
+seven times over). Lives inside crvae_model/, next to the model it trains,
+and imports only from crvae_model itself (crvae_model.model,
+crvae_model.utils.*) plus config.py and a dataset's .npz -- never from the
+project root's utils/ package, which is the attack stage's own, separate
+copy (see crvae_model/utils/common.py's module docstring). The root is for
+the pipeline's entry points (run_model.py, run_attack.py) and the attack
+itself (attack.py), not for this stage's implementation. One call to `run_grid`
+(via `run_dataset_seed`) produces one run directory, stored directly under
+the dataset's own artifacts folder:
+
+artifacts/seed<S>/artifacts_<dataset>/crvae__grid__seed<S>__<timestamp>/
+    run.log             every combination's log lines, in one file (the
+                         original scripts redirected sys.stdout to a fresh
+                         file per combination)
+    meta.json           grid + data + env summary, best trial pointer, total runtime
+    grid_results.csv    one row per combination: hyperparameters, best_val_loss, status
+    test_windows.npz    held-out test split, same for every trial in this grid
+    trials/comb_XXXX/
+        checkpoint.pt   this combination's own best (early-stopped) weights,
+                         self-contained: n_dim, hidden_size and the causal
+                         graph itself travel with it (see the attack-side
+                         utils.data_utils.load_model, which reads this file
+                         back without needing any code from this package)
+        metadata.json   this combination's config + best-epoch summary + held-out test eval
+        history.npz     that trial's full per-epoch loss curves
+    best/
+        checkpoint.pt   the combination with the lowest best_val_loss
+        metadata.json
+        history.npz
+
+and updates artifacts/seed<S>/artifacts_<dataset>/registry.json. The attack
+stage (attack.py, at the project root) reads that registry to find which
+experiment directory -- and, inside it, which checkpoint.pt -- to load; the
+checkpoint file is the only handoff between the two stages, not a shared
+import.
+
+What changed vs. the original train_<dataset>.py, besides the de-duplication:
+  - hyperparameter combinations come from config.CRVAE_PARAM_GRID instead of
+    being hardcoded per dataset at the bottom of each file;
+  - device placement goes through crvae_model.utils.common.resolve_device
+    instead of a bare `.cuda()` (see crvae_model.model's docstring on the
+    same class of portability bug);
+  - a failing combination logs its full traceback and the grid moves on to
+    the next one, instead of the whole run dying;
+  - train/val split is now chronological, with a third held-out test split
+    evaluated once per trial on the reloaded best weights (see
+    crvae_model.utils.data_utils.create_split_windows's docstring) -- the
+    original scripts only ever produced a random 80/20 train/val split;
+  - every epoch's loss components (mse/kl), not just the combined loss, are
+    genuine epoch-wide sample-weighted averages -- the original code
+    computed `train_mse` from `total_train_loss` (a copy-paste bug: line
+    `train_mse = total_train_loss / len(train_dl.dataset)` used the wrong
+    accumulator), so the "MSE" curve it logged was actually a second copy of
+    the combined loss curve, not the MSE term alone. Fixed here by dividing
+    each accumulator by its own name.
+"""
+
+from __future__ import annotations
+
+import traceback
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-import numpy as np
-from itertools import product
+from torch.utils.data import DataLoader, TensorDataset
 
-# Considering BASE folder as 'timecaust' with empty __init__.py
-# Code execution has to be done from 'timecaust' folder for relative imports to work
-from utils import load_data, getModelName, epoch_time, getCausalMatrix
+import config
 from crvae_model.model import cLSTM
+from crvae_model.utils import common, data_utils
 
-def train_epoch(model, train_dl, val_dl, optimizer, beta_kl):
-    total_train_loss = 0
-    total_train_mse = 0
-    total_train_kl = 0
+
+# --------------------------------------------------------------------------- #
+# One epoch (train + val)
+# --------------------------------------------------------------------------- #
+def train_epoch(model, train_dl, val_dl, optimizer, beta_kl, device):
     model.train()
-    acc_steps = 1
-    for idx, (X_l, X_r) in enumerate(train_dl):
-        X_l = X_l.cuda()
-        X_r = X_r.cuda()
+    agg = {"loss": 0.0, "mse": 0.0, "kl": 0.0}
+    n = 0
+    for X_l, X_r in train_dl:
+        X_l, X_r = X_l.to(device), X_r.to(device)
         optimizer.zero_grad()
-        pred, train_kl = model(X_l, future=X_r.shape[1])
-        train_mse = f.mse_loss(pred, X_r)
-        loss = train_mse + beta_kl * train_kl
-        loss /= acc_steps
+        pred, kl = model(X_l, future=X_r.shape[1])
+        mse = F.mse_loss(pred, X_r)
+        loss = mse + beta_kl * kl
         loss.backward()
         optimizer.step()
-        total_train_loss += loss.item() * X_l.size(0)
-        total_train_mse += train_mse.item() * X_l.size(0)
-        total_train_kl += train_kl.item() * X_l.size(0)
-
-    train_loss = total_train_loss / len(train_dl.dataset)
-    train_mse = total_train_loss / len(train_dl.dataset)
-    train_kl = total_train_kl / len(train_dl.dataset)
-    torch.cuda.empty_cache()
+        bs = X_l.size(0)
+        agg["loss"] += loss.item() * bs
+        agg["mse"] += mse.item() * bs
+        agg["kl"] += kl.item() * bs
+        n += bs
+    train_agg = {k: v / n for k, v in agg.items()}
 
     model.eval()
-    total_val_loss = 0
-    total_val_mse = 0
-    total_val_kl = 0
+    agg = {"loss": 0.0, "mse": 0.0, "kl": 0.0}
+    n = 0
     with torch.no_grad():
         for X_l, X_r in val_dl:
-            X_l, X_r = X_l.cuda(), X_r.cuda()
-            pred, val_kl = model(X_l, future=X_r.shape[1])
-            val_mse = f.mse_loss(pred, X_r)
-            loss = val_mse + beta_kl * val_kl
-            total_val_loss += loss.item() * X_l.size(0)
-            total_val_mse += val_mse.item() * X_l.size(0)
-            total_val_kl += val_kl.item() * X_l.size(0)
-    
-    val_loss = total_val_loss / len(val_dl.dataset)
-    val_mse = total_val_mse / len(val_dl.dataset)
-    val_kl = total_val_kl / len(val_dl.dataset)
-    torch.cuda.empty_cache()
-    
-    return train_loss, val_loss, train_mse, train_kl, val_mse, val_kl
+            X_l, X_r = X_l.to(device), X_r.to(device)
+            pred, kl = model(X_l, future=X_r.shape[1])
+            mse = F.mse_loss(pred, X_r)
+            loss = mse + beta_kl * kl
+            bs = X_l.size(0)
+            agg["loss"] += loss.item() * bs
+            agg["mse"] += mse.item() * bs
+            agg["kl"] += kl.item() * bs
+            n += bs
+    val_agg = {k: v / n for k, v in agg.items()}
 
-def trainer(dataset_name, param_grid, X_train_left1, X_train_right1, X_val_left1, X_val_right1, patience, step_size):
-    BASE_DIR = os.path.abspath('')
+    return train_agg, val_agg
 
-    dataset_name, data_artifact = dataset_name
-    print(f"Using dataset: {data_artifact}", flush=True)
-    if not os.path.exists(os.path.join(BASE_DIR, f'artifacts_{dataset_name}')):
-        os.mkdir(os.path.join(BASE_DIR, f'artifacts_{dataset_name}'))
-    model_name = getModelName(dataset=data_artifact, model_type='crvae')
 
-    artifact_path = os.path.join(BASE_DIR, f'artifacts_{dataset_name}', model_name)
-    os.mkdir(artifact_path)
-    checkpoints_path = os.path.join(artifact_path, 'checkpoints')
-    os.mkdir(checkpoints_path)
-    metadata_path = os.path.join(artifact_path, 'metadata')
-    os.mkdir(metadata_path)
-    logs_path = os.path.join(artifact_path, 'logs')
-    os.mkdir(logs_path)
+@torch.no_grad()
+def eval_epoch(model, loader, beta_kl, device):
+    """One no-grad pass, used for the held-out test split once, after training."""
+    model.eval()
+    agg = {"loss": 0.0, "mse": 0.0, "kl": 0.0}
+    n = 0
+    for X_l, X_r in loader:
+        X_l, X_r = X_l.to(device), X_r.to(device)
+        pred, kl = model(X_l, future=X_r.shape[1])
+        mse = F.mse_loss(pred, X_r)
+        loss = mse + beta_kl * kl
+        bs = X_l.size(0)
+        agg["loss"] += loss.item() * bs
+        agg["mse"] += mse.item() * bs
+        agg["kl"] += kl.item() * bs
+        n += bs
+    return {k: v / n for k, v in agg.items()}
 
-    input_size = len(X_train_left1[0][0]) # X_train_left.shape[-1]
-    seq_len = len(X_train_left1[0]) + 1 # X_train_left.shape[-2] + 1
-    GC = getCausalMatrix(n_dim=input_size, data=dataset_name)
 
-    param_combinations = list(product(
-    param_grid['lr'],
-    param_grid['batch_size'],
-    param_grid['hidden_size'],
-    param_grid['num_layers'],
-    param_grid['dropout'],
-    param_grid['beta_kl']
-    ))
+# --------------------------------------------------------------------------- #
+# One trial (one hyperparameter combination, trained to early stopping)
+# --------------------------------------------------------------------------- #
+def _make_loader(windows, batch_size, shuffle):
+    lefts, rights = zip(*(data_utils.split_window(np.array(w)) for w in windows))
+    ds = TensorDataset(torch.FloatTensor(np.array(lefts)), torch.FloatTensor(np.array(rights)))
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 
-    # best_val_loss = np.inf # For global best model (runtime error)
-    epochs = 5000
-    combination = 0
-    metadata_list = []
-    start_gs = time.time()
-    for lr, batch_size, hidden_size, num_layers, dropout, beta_kl in param_combinations:
-        combination += 1
-        sys.stdout = open(os.path.join(logs_path, f'train_comb{combination}.log'), 'w')
-        print(f"Using dataset: {data_artifact}", flush=True)
-        print(f"\nTraining with combination {combination} ::\nInitial LR: {lr}\tBatch size: {batch_size}\tnum_layers: {num_layers}\tDropout: {dropout}\tbeta_kl: {beta_kl}", flush=True)
-        X_train_left = np.array(X_train_left1)
-        X_train_right = np.array(X_train_right1)
-        train_dl = DataLoader(TensorDataset(torch.FloatTensor(X_train_left), torch.FloatTensor(X_train_right)), batch_size=batch_size, shuffle=False)
-        del X_train_left, X_train_right
-        gc.collect()
-        
-        X_val_left = np.array(X_val_left1)
-        X_val_right = np.array(X_val_right1)
-        val_dl = DataLoader(TensorDataset(torch.FloatTensor(X_val_left), torch.FloatTensor(X_val_right)), batch_size=batch_size)
-        del X_val_left, X_val_right
-        gc.collect()
 
-        model = cLSTM(n_dim=input_size, hidden_size=hidden_size, causal_graph=GC).cuda()
-        optimizer = AdamW(model.parameters(), lr=lr)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=step_size)
+def run_trial(hp: dict, dataset: str, seed: int, n_dim: int, causal_graph,
+              X_train, X_val, X_test, device, logger) -> dict:
+    lr, batch_size, hidden_size, num_layers, dropout, beta_kl = (
+        hp["lr"], hp["batch_size"], hp["hidden_size"], hp["num_layers"], hp["dropout"], hp["beta_kl"]
+    )
+    logger.info(f"    lr={lr}  batch_size={batch_size}  hidden_size={hidden_size}  "
+                f"num_layers={num_layers}  dropout={dropout}  beta_kl={beta_kl}")
 
-        train_loss_list = {
-            'loss':[], 'mse':[], 'kl':[]
-        }
-        val_loss_list = {
-            'loss':[], 'mse':[], 'kl':[]
-        }
+    train_dl = _make_loader(X_train, batch_size, shuffle=False)
+    val_dl = _make_loader(X_val, batch_size, shuffle=False)
 
-        best_epoch = 0
-        best_val_loss = np.inf # For best model in each combo (runs perfectly)
-        step_counter = 0
-        start = time.time()
-        for epoch in range(epochs):
-            print(f"\nEpoch {epoch+1}\tLearning rate : {scheduler.get_last_lr()}\n", flush=True)
-            start_ep = time.time()
-            train_loss, val_loss, train_mse, train_kl, val_mse, val_kl = train_epoch(model, train_dl, val_dl, optimizer, beta_kl)
-            end_ep = time.time()
-            train_loss_list['loss'].append(train_loss)
-            val_loss_list['loss'].append(val_loss)
-            train_loss_list['mse'].append(train_mse)
-            train_loss_list['kl'].append(train_kl)
-            val_loss_list['mse'].append(val_mse)
-            val_loss_list['kl'].append(val_kl)
-        
-            print(f"Train loss: {train_loss:10.6f}\tTrain MSE: {train_mse:10.6f}\tTrain KL: {train_kl:10.6f}", flush=True)
-            print(f"Validation loss: {val_loss:10.6f}\tVal MSE: {val_mse:10.6f}\tVal KL: {val_kl:10.6f}", flush=True)
+    model = cLSTM(n_dim=n_dim, hidden_size=hidden_size, causal_graph=causal_graph).to(device)
+    optimizer = AdamW(model.parameters(), lr=lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=config.CRVAE_TRAIN["lr_factor"],
+                                   patience=config.CRVAE_TRAIN["lr_patience"])
 
-            _, mn, sc = epoch_time(start_ep, end_ep)
-            print(f"Epoch execution time : {mn}min. {sc:.6f}sec.", flush=True)
+    history: list[dict] = []
+    best_epoch, best_val_loss, best_state = 0, float("inf"), None
+    step_counter = 0
+    epoch = -1
 
-            if val_loss < best_val_loss :
-                best_val_loss = val_loss
-                step_counter = 0
-                best_epoch = epoch+1
-                metadata = {
-                    'combination' : combination,
-                    'dataset' : data_artifact,
-                    'n_dim' : input_size,
-                    'seq_len' : seq_len,
-                    'artifact' : model_name,
-                    'model' : {
-                        'batch_size' : batch_size,
-                        'input_size' : input_size,
-                        'hidden_size' : hidden_size,
-                        'num_layers' : num_layers,
-                        'dropout' : dropout
-                    },
-                    'max_epochs' : epoch,
-                    'initial_lr' : lr,
-                    'earlystopper_patience' : patience,
-                    'lr_step' : step_size,
-                    'beta_kl' : beta_kl
-                }
-                torch.save(model.state_dict(), os.path.join(checkpoints_path, f'checkpoint_comb{combination}.pt'))
-                print(f"Model recorded with Val loss : {val_loss}", flush=True)
-                best_epoch = epoch
+    with common.Timer() as trial_timer:
+        for epoch in range(config.CRVAE_TRAIN["epochs"]):
+            with common.Timer() as epoch_timer:
+                train_agg, val_agg = train_epoch(model, train_dl, val_dl, optimizer, beta_kl, device)
+
+            history.append({
+                "epoch": epoch + 1, "lr": scheduler.get_last_lr()[0],
+                "train_loss": train_agg["loss"], "train_mse": train_agg["mse"], "train_kl": train_agg["kl"],
+                "val_loss": val_agg["loss"], "val_mse": val_agg["mse"], "val_kl": val_agg["kl"],
+                "epoch_time_s": round(epoch_timer.elapsed, 4),
+            })
+
+            if epoch % 25 == 0 or epoch == 0:
+                logger.info(f"    epoch {epoch + 1:5d} | lr {scheduler.get_last_lr()[0]:.2e} "
+                            f"| train_loss {train_agg['loss']:.6f} | val_loss {val_agg['loss']:.6f} "
+                            f"| {epoch_timer.elapsed:.2f}s/epoch")
+
+            if val_agg["loss"] < best_val_loss:
+                best_val_loss, step_counter, best_epoch = val_agg["loss"], 0, epoch + 1
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                logger.info(f"    new best | val_loss={val_agg['loss']:.6f} @ epoch {epoch + 1}")
             else:
                 step_counter += 1
-                # step_counter = 0 # For runtime error (no improvement at all)
-            
-            scheduler.step(val_loss)
-            if step_counter >= patience:
-                print(f"Model not improving. Moving on to next combination ...", flush=True)
+
+            scheduler.step(val_agg["loss"])
+
+            if step_counter >= config.CRVAE_TRAIN["patience"]:
+                logger.info(f"    early stop at epoch {epoch + 1} (best epoch {best_epoch})")
                 break
-            torch.cuda.empty_cache()
-        
-        end = time.time()
-        h, m, s = epoch_time(start, end)
-        metadata['final_epoch'] = epoch
-        metadata['optimal_epoch'] = best_epoch
-        metadata['best_val_loss'] = best_val_loss
-        metadata['training_time'] = {'hr' : h, 'mins' : m, 'sec' : s}
-        metadata['avg_epoch_sec'] = (end - start)/(epoch+1)
-        metadata['train_loss_list'] = train_loss_list
-        metadata['val_loss_list'] = val_loss_list
-        print(f"Total training time : {h}hrs. {m}mins. {s}sec.", flush=True)
-        print("\n"+"#"*100+"\n"+"#"*100+"\n"+"#"*100+"\n", flush=True)
-        sys.stdout = sys.__stdout__
-        torch.cuda.empty_cache()
-        metadata_list.append(metadata)
-        with open(os.path.join(metadata_path, f'metadata_comb{combination}.json'), 'w') as f:
-            json.dump(metadata, f, indent=4)
-    
-    end_gs = time.time()
-    h, m, s = epoch_time(start_gs, end_gs)
-    print(f"Total Grid Search training time : {h}hrs. {m}mins. {s}sec.", flush=True)
-    metadata_list.append({'grid_search_time' : {'hr' : h, 'mins' : m, 'sec' : s}})
-    # sys.stdout = sys.__stdout__
-    return metadata_list
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
+    train_time = trial_timer.elapsed
+    if best_state is None:
+        raise RuntimeError(f"trial produced no valid checkpoint (val_loss never improved from +inf) "
+                            f"after {epoch + 1} epoch(s); hp={hp}")
+    model.load_state_dict(best_state)
+    best_record = history[best_epoch - 1]
 
-if __name__=="__main__":
-    torch.manual_seed(42)
-    np.random.seed(42)
+    # Held-out test evaluation: one pass, on the reloaded best weights.
+    # Never used for model selection -- purely recorded for later inspection.
+    test_dl = _make_loader(X_test, batch_size, shuffle=False)
+    with common.Timer() as test_timer:
+        test_agg = eval_epoch(model, test_dl, beta_kl, device)
+    test_block = {**test_agg, "n_test": len(X_test), "eval_time_s": round(test_timer.elapsed, 4)}
+    logger.info(f"    test | loss={test_block['loss']:.6f} | {common.fmt_seconds(test_block['eval_time_s'])}")
 
-    BASE_DIR = os.path.abspath('')
-
-    ####################################################################
-    ### Manually change this place for other datasets
-    dataset_name = 'henon'
-    dataset_artifact = 'henon_10001_10_50.h5'
-    context = 50
-    datapath = os.path.join(BASE_DIR, 'data', dataset_artifact)
-    ####################################################################
-
-    print(f"Loading dataset : {dataset_name} ...", flush=True)
-    X_train_left, X_train_right, X_val_left, X_val_right = load_data(datapath)
-    print(f"Dataset loaded.", flush=True)
-
-    # param_grid = {
-    # "lr" : [0.001, 0.005],
-    # "batch_size" : [256, 512, 1024],
-    # "hidden_size" : [64, 128, 256],
-    # "num_layers" : [1],
-    # "dropout" : [0],
-    # "beta_kl": [0.005, 0.01, 0.05, 0.1]
-    # }
-
-    # Optimal Config after Grid Search
-    param_grid = {
-    "lr" : [0.005],
-    "batch_size" : [512],
-    "hidden_size" : [128],
-    "num_layers" : [1],
-    "dropout" : [0],
-    "beta_kl": [0.05]
+    model_hp = {"n_dim": n_dim, "hidden_size": hidden_size, "causal_graph": np.asarray(causal_graph).tolist()}
+    metadata = {
+        "dataset": dataset, "train_seed": seed, "n_dim": n_dim,
+        "model": {**model_hp, "batch_size": batch_size, "num_layers": num_layers, "dropout": dropout},
+        "initial_lr": lr, "earlystopper_patience": config.CRVAE_TRAIN["patience"],
+        "lr_step": config.CRVAE_TRAIN["lr_patience"], "beta_kl": beta_kl,
+        "final_epoch": epoch, "optimal_epoch": best_epoch, "best_val_loss": best_val_loss,
+        "training_time": common.fmt_seconds(train_time), "avg_epoch_sec": train_time / (epoch + 1),
+        "n_epochs_recorded": len(history), "test": test_block,
     }
 
-    metadata_list = trainer(
-        dataset_name=(dataset_name, dataset_artifact.split('.')[0]),
-        param_grid=param_grid,
-        X_train_left1=X_train_left, X_train_right1=X_train_right, X_val_left1=X_val_left, X_val_right1=X_val_right,
-        patience=100, step_size=20
-    )
+    return {"model": model, "model_hp": model_hp, "metadata": metadata, "history": history, "train_time_s": train_time}
 
-    with open(os.path.join(BASE_DIR, f'artifacts_{dataset_name}', metadata_list[0]['artifact'], 'train_metadata_all.jsonl'), 'w') as f:
-        for obj in metadata_list:
-            f.write(json.dumps(obj)+'\n')
+
+# --------------------------------------------------------------------------- #
+# Grid search over one (dataset, seed)
+# --------------------------------------------------------------------------- #
+def run_grid(dataset: str, seed: int, artifacts_root: str | Path) -> dict:
+    trials = config.expand_crvae_grid()
+    ds_cfg = config.DATASETS[dataset]
+    npz_path, context = ds_cfg["npz"], ds_cfg["context"]
+
+    ds_dir = common.dataset_artifact_dir(artifacts_root, dataset)
+    run_dir = common.unique_dir(ds_dir / common.build_run_name("crvae" or config.BASE_TAG, "grid" or config.CRVAE_SEC_TAG, seed))
+    trials_dir, best_dir = run_dir / "trials", run_dir / "best"
+    trials_dir.mkdir(parents=True, exist_ok=True)
+    best_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = common.get_logger(f"crvae.{dataset}.seed{seed}", run_dir / "run.log")
+    device = common.resolve_device(config.DEVICE)
+    logger.info("=" * 88)
+    logger.info(f"TimeCAT surrogate training | dataset={dataset} | seed={seed} | device={device} | started {common.timestamp()}")
+    logger.info(f"run_dir={run_dir}")
+    logger.info(f"npz={npz_path} | context={context} | data_version={config.CRVAE_TRAIN['data_version']} | "
+                f"{len(trials)} combinations queued")
+
+    common.set_deterministic(seed)
+    X, _meta = data_utils.load_trajectory(npz_path, version=config.CRVAE_TRAIN["data_version"])
+    X_train, X_val, X_test = data_utils.create_split_windows(
+        X, context=context, val_frac=config.CRVAE_TRAIN["val_frac"], test_frac=config.CRVAE_TRAIN["test_frac"],
+        logger=logger,
+    )
+    n_dim = len(X_train[0][0])
+    logger.info(f"n_dim={n_dim} | context={context} | n_train={len(X_train)} | n_val={len(X_val)} | n_test={len(X_test)}")
+
+    causal_graph = data_utils.load_ground_truth(npz_path)
+    logger.info(f"causal graph loaded | shape={causal_graph.shape}")
+
+    test_path = run_dir / "test_windows.npz"
+    np.savez_compressed(test_path, X_test=np.array(X_test, dtype=np.float32))
+
+    csv_path = run_dir / "grid_results.csv"
+    results, best, failed = [], None, []
+    row_keys = ["combination", "status", *config.CRVAE_GRID_KEYS,
+                "best_epoch", "final_epoch", "best_val_loss", "test_loss", "train_time_s", "error"]
+
+    with common.Timer() as grid_timer:
+        for i, hp in enumerate(trials, start=1):
+            logger.info("-" * 88)
+            logger.info(f"combination {i:04d}/{len(trials)} | started {common.timestamp()} | hp={hp}")
+            trial_dir = trials_dir / f"comb_{i:04d}"
+            trial_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                out = run_trial(hp=hp, dataset=dataset, seed=seed, n_dim=n_dim, causal_graph=causal_graph,
+                                 X_train=X_train, X_val=X_val, X_test=X_test, device=device, logger=logger)
+            except Exception as e:
+                logger.error(f"[FAILED] combination {i:04d} | hp={hp}\n{traceback.format_exc()}")
+                row = {k: None for k in row_keys}
+                row.update({"combination": i, "status": "FAILED", **hp, "error": f"{type(e).__name__}: {e}"})
+                common.append_csv_row(csv_path, {k: row[k] for k in row_keys})
+                failed.append(i)
+                continue
+
+            history_path = trial_dir / "history.npz"
+            common.save_history(history_path, out["history"])
+            out["metadata"]["history_path"] = history_path.as_posix()
+            common.save_checkpoint(trial_dir / "checkpoint.pt", out["model"], out["model_hp"])
+            common.save_json(out["metadata"], trial_dir / "metadata.json")
+
+            row = {k: None for k in row_keys}
+            row.update({
+                "combination": i, "status": "OK", **hp,
+                "best_epoch": out["metadata"]["optimal_epoch"], "final_epoch": out["metadata"]["final_epoch"],
+                "best_val_loss": round(out["metadata"]["best_val_loss"], 6),
+                "test_loss": round(out["metadata"]["test"]["loss"], 6),
+                "train_time_s": round(out["train_time_s"], 2),
+            })
+            common.append_csv_row(csv_path, {k: row[k] for k in row_keys})
+            results.append(row)
+
+            logger.info(f"combination {i:04d} done | best_val_loss={out['metadata']['best_val_loss']:.6f} "
+                        f"| test_loss={out['metadata']['test']['loss']:.6f} "
+                        f"| epochs={out['metadata']['final_epoch'] + 1} | {common.fmt_seconds(out['train_time_s'])}")
+
+            score = out["metadata"]["best_val_loss"]
+            if best is None or score < best["score"] - 1e-9:
+                best = {"score": score, "combination": i, "hp": hp, "out": out}
+
+    if best is None:
+        logger.error(f"[ABORT] every combination failed for {dataset} seed {seed}; see errors above")
+        raise RuntimeError(f"all {len(trials)} combinations failed for {dataset} seed {seed}; see {run_dir / 'run.log'}")
+
+    best_history_path = best_dir / "history.npz"
+    common.save_history(best_history_path, best["out"]["history"])
+    best_meta = {**best["out"]["metadata"], "history_path": best_history_path.as_posix()}
+    common.save_checkpoint(best_dir / "checkpoint.pt", best["out"]["model"], best["out"]["model_hp"])
+    common.save_json(best_meta, best_dir / "metadata.json")
+
+    meta = {
+        "dataset": dataset, "seed": seed, "npz": npz_path, "context": context,
+        "n_dim": n_dim, "device": str(device), "run_dir": run_dir.as_posix(),
+        "n_train": len(X_train), "n_val": len(X_val), "n_test": len(X_test),
+        "test_windows_path": test_path.as_posix(),
+        "n_combinations": len(trials), "n_ok": len(results), "n_failed": len(failed),
+        "failed_combinations": failed,
+        "grid_time_s": round(grid_timer.elapsed, 2), "grid_time_h": round(grid_timer.elapsed / 3600, 4),
+        "best_combination": best["combination"], "best_hp": best["hp"], "best_val_loss": best["score"],
+        "param_grid": config.CRVAE_PARAM_GRID, "train_config": config.CRVAE_TRAIN,
+        "env": common.env_info(),
+    }
+    common.save_json(meta, run_dir / "meta.json")
+
+    logger.info("=" * 88)
+    logger.info(f"BEST | combination {best['combination']} | hp={best['hp']} | val_loss={best['score']:.6f}")
+    logger.info(f"grid finished in {common.fmt_seconds(grid_timer.elapsed)} | "
+                f"{len(failed)}/{len(trials)} failed | artifacts at {run_dir}")
+
+    entry = {
+        "dataset": dataset, "seed": seed, "run_dir": run_dir.as_posix(),
+        "checkpoint_path": (best_dir / "checkpoint.pt").as_posix(),
+        "history_path": best_history_path.as_posix(),
+        "hp": best["hp"], "best_val_loss": best["score"], "test_loss": best_meta["test"]["loss"],
+        "n_dim": n_dim, "context": context,
+        "n_train": len(X_train), "n_val": len(X_val), "n_test": len(X_test),
+        "n_combinations": len(trials), "n_failed": len(failed),
+        "grid_time_s": round(grid_timer.elapsed, 2), "npz": npz_path,
+    }
+    common.update_registry(ds_dir / "registry.json", run_dir.name, entry, promote=config.PROMOTE, logger=logger)
+    return entry
+
+
+def run_dataset_seed(dataset: str, seed: int, artifacts_root: str | Path | None = None) -> dict:
+    """The one function both run_model.py (in-process, single job) and this
+    file's __main__ block (one subprocess per job) call."""
+    if dataset not in config.DATASETS:
+        raise ValueError(f"unknown dataset {dataset!r}; expected one of {sorted(config.DATASETS)}")
+    root = Path(artifacts_root) if artifacts_root else common.seed_artifact_root(seed, base=config.ARTIFACTS_DIR)
+    return run_grid(dataset, seed, root)
+
+
+if __name__ == "__main__":
+    import os
+    # Used when run_model.py dispatches this as a subprocess: it sets TCAT_DATASET /
+    # TCAT_SEED for exactly one job. Running `python -m crvae_model.train`
+    # directly (no env vars set) falls back to the first entry of
+    # config.RUN_DATASETS / config.RUN_SEEDS.
+    _dataset = os.environ.get("TCAT_DATASET", config.RUN_DATASETS[0])
+    _seed = int(os.environ.get("TCAT_SEED", config.RUN_SEEDS[0]))
+    run_dataset_seed(_dataset, _seed)
